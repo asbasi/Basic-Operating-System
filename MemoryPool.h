@@ -2,6 +2,9 @@
 #include <stdint.h>
 #include <vector>
 
+#ifndef MEMORY_POOL_H
+#define MEMORY_POOL_H
+
 extern "C"
 {
 
@@ -43,3 +46,5 @@ class MemoryPool
 };
 
 }
+
+#endif

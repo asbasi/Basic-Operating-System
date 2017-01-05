@@ -31,6 +31,6 @@ class Mutex
         // Remove a mutex from the waiting queue.
         void stopWaiting(TVMThreadID tid);
 };
-
 }
+
 #endif

@@ -3,6 +3,9 @@
 #include <cstddef>
 #include <vector>
 
+#ifndef MEMORY_MANAGER_H
+#define MEMORY_MANAGER_H
+
 extern "C"
 {
 
@@ -28,3 +31,5 @@ class MemoryManager
 };
 
 }
+
+#endif

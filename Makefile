@@ -20,6 +20,7 @@ OBJS=$(OBJDIR)/Machine.o \
      $(OBJDIR)/Scheduler.o \
      $(OBJDIR)/Mutex.o \
      $(OBJDIR)/MemoryPool.o \
+     $(OBJDIR)/FileSystem.o \
      $(OBJDIR)/MemoryManager.o
      
      

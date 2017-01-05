@@ -1,7 +1,7 @@
 #include "Machine.h"
 #include "MemoryManager.h"
-#include "Scheduler.h"
 #include "Machine.h"
+#include "FileSystem.h"
 #include <sys/types.h>
 #include <fcntl.h>
 #include <math.h>
@@ -12,50 +12,30 @@ using namespace std;
 
 extern "C"
 {
-
-    #define MAX_WRITE_SIZE 512
-    #define MAX_READ_SIZE  512
-
-    #define WORD_SIZE_16    16
-    #define BYTES_PER_ENTRY 32
-    #define SECTOR_SIZE     512
-
-    #define DIR_ATTR           11
-    #define DIR_NTRES          12
-    #define DIR_CRT_TIME_TENTH 13
-    #define DIR_CRT_TIME       14
-    #define DIR_CRT_DATE       16
-    #define DIR_LAST_ACC_DATE  18
-    #define DIR_FIRST_CLUS_HI  20
-    #define DIR_WRITE_TIME     22
-    #define DIR_WRITE_DATE     24
-    #define DIR_FIRST_CLUS_LO  26
-    #define DIR_FILE_SIZE      28
-
-    #define ATTR_READ_ONLY  0x01
-    #define ATTR_HIDDEN     0x02
-    #define ATTR_SYSTEM     0x04
-    #define ATTR_VOLUME_ID  0x08
-    #define ATTR_DIRECTORY  0x10
-    #define ATTR_ARCHIVE    0x20
-    #define ATTR_LONG_NAME  (ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID)
-
-    #define grabMutex()     VMMutexAcquire(FILE_SYSTEM_MUTEX, VM_TIMEOUT_INFINITE)
-    #define releaseMutex()  VMMutexRelease(FILE_SYSTEM_MUTEX)
-
-
     TVMMainEntry VMLoadModule(const char* module);
     void VMUnloadModule();
     void fileHandler(void* calldata, int result);
 
     Scheduler* myScheduler;
     MemoryManager* myMemoryManager;
+    FileSystem* myFileSystem;
 
     volatile TVMTick tickCount = 0;
     volatile int tickTime;
 
     volatile int nextFileDescriptor = 3;
     volatile int nextDirDescriptor  = 3;
+
+    const TVMMemoryPoolID VM_MEMORY_POOL_ID_SYSTEM = 1;
+
+    TVMMemoryPoolID heapID;
+    TVMMemoryPoolID stackID;
+
+    TVMMutexID FILE_SYSTEM_MUTEX;
+
+    vector<Directory*> openDirectories;
+    vector<File*> openFiles;
+    vector<Cluster*> cachedClusters;
 
     void idle(void* param)
     {
@@ -70,269 +50,9 @@ extern "C"
         myScheduler->scheduleNext();
     }
 
-    const TVMMemoryPoolID VM_MEMORY_POOL_ID_SYSTEM = 1;
-
-
-    TVMMemoryPoolID heapID;
-    TVMMemoryPoolID stackID;
-
-    TVMMutexID FILE_SYSTEM_MUTEX;
-
 /*******************************************************************************************************
                                         File Functions/Classes
 *******************************************************************************************************/
-	
-    typedef struct
-    {
-        int dirdescriptor;  // Descriptor associated with the file.
-        bool isRoot;        // Is it the root direcotry?
-        uint8_t* currEntry; // The entry are we currently on (the next one that should be read in).
-
-        uint16_t startingCluster; // Starting cluster of the directory.
-        uint16_t currentCluster;  // Current cluster that we're reading fro
-        int currentSector;
-    } Directory;
-
-    typedef struct
-    {
-        int filedescriptor;    // Descriptor associated with the file.
-        unsigned int filePtr;  // The file pointer which keeps track of where in the file we are.
-        int flags;             // The flags the file was opened with.
-        int mode;              // The mode the file was opened with.
-        uint8_t* entry;        // The entry for the file.
-    } File;
-
-    typedef struct
-    {
-        uint8_t* data;
-        uint16_t clusterNum;
-    } Cluster;
-
-    class FileSystem
-    {
-        public:
-            // Holds the current working directory.
-            char cwd[VM_FILE_SYSTEM_MAX_PATH + 1];
-
-            // General File System Attributes.
-            char* mount;
-            int   fileDescriptor;
-            uint8_t* base;
-
-            // BPB Values.
-            uint16_t BytesPerSector;
-            uint8_t  SectorsPerCluster;
-            uint16_t ReservedSectorCount;
-            uint8_t  NumFATs;
-            uint16_t RootEntryCount;
-            uint16_t TotalSector16;
-            uint16_t FATSize16;
-            uint32_t HiddenSectors;
-            uint32_t TotalSector32;
-
-            uint16_t FirstRootSector;
-            uint16_t FirstDataSector;
-
-            // Fat Table.
-            uint16_t* FatTable;
-
-            // All Entries in root.
-            uint8_t* RootEntries;
-
-        public:
-            FileSystem(char* mount, int fileDescriptor, void* base)
-            {
-                this->cwd[0] = VM_FILE_SYSTEM_DIRECTORY_DELIMETER; // '/'
-                this->cwd[1] = '\0';
-
-                this->mount         = mount;
-                this->fileDescriptor = fileDescriptor;
-                this->base          = (uint8_t*)base;
-
-                processBPB();
-                processFAT();
-                processRoot();
-
-                FirstRootSector = ReservedSectorCount + NumFATs * FATSize16;
-                FirstDataSector = FirstRootSector + (RootEntryCount * 32 / 512);
-            }
-
-            ~FileSystem()
-            {
-                uint16_t* fat = this->FatTable;
-
-                // Write back FAT table and duplicate.
-                grabMutex();
-
-                for(int i = 0; i < this->FATSize16; i++)
-                {
-                    memcpy(base, (void*)fat, MAX_WRITE_SIZE);
-                    fat += this->BytesPerSector / 2;
-
-                    writeSector(this->ReservedSectorCount + i, base, MAX_WRITE_SIZE);
-                    writeSector(this->ReservedSectorCount + 17 + i, base, MAX_WRITE_SIZE);
-                }
-
-                releaseMutex();
-
-                // Delete the FAT table.
-                delete[] FatTable;
-
-                // Write back all the entires.
-                grabMutex();
-
-                uint8_t* root = RootEntries;
-
-                int RootDirectorySectors = (this->RootEntryCount * BYTES_PER_ENTRY) / this->BytesPerSector;
-                for(int i = 0; i < RootDirectorySectors; i++)
-                {
-                    memcpy(base, (void*)root, MAX_WRITE_SIZE);
-                    root += 512;
-
-                    writeSector(this->ReservedSectorCount + (this->NumFATs * this->FATSize16) + i, base, MAX_WRITE_SIZE);
-                }
-
-                releaseMutex();
-
-                // Delete the root entries.
-                delete[] RootEntries;
-            }
-
-            char* getCWD()
-            {
-                return this->cwd;
-            }
-
-            uint8_t* getRoot()
-            {
-                return this->RootEntries;
-            }
-
-            void processBPB()
-            {
-                grabMutex();
-
-                ThreadControlBlock* currentThread = myScheduler->getCurrentThread();
-                MachineFileRead(this->fileDescriptor, this->base, MAX_READ_SIZE, fileHandler, (void*)currentThread);
-                waitForIO();
-
-                // Read in BPB.
-                this->BytesPerSector = *((uint16_t*)(this->base + 11));
-                this->SectorsPerCluster = this->base[13];
-                this->ReservedSectorCount = *((uint16_t*)(this->base + 14));
-                this->NumFATs = this->base[16];
-                this->RootEntryCount = *((uint16_t*)(this->base + 17));
-                this->TotalSector16 = *((uint16_t*)(this->base + 19));
-                this->FATSize16 = *((uint16_t*)(this->base + 22));
-                this->HiddenSectors = *((uint32_t*)(this->base + 28));
-                this->TotalSector32 = *((uint32_t*)(this->base + 32));
-
-                /*cout << "Bytes Per Sector: " <<  this->BytesPerSector << endl;
-                cout << "Sectors Per Cluster: " << (uint16_t)this->SectorsPerCluster << endl;
-                cout << "Reserved Sector Count: " << this->ReservedSectorCount << endl;
-                cout << "Num FATs: " << (uint16_t)this->NumFATs << endl;
-                cout << "Root Entry Count: " << this->RootEntryCount << endl;
-                cout << "Total Sector 16: " << this->TotalSector16 << endl;
-                cout << "FAT Size 16: " << this->FATSize16 << endl;
-                cout << "Hidden Sectors: " << this->HiddenSectors << endl;
-                cout << "Total Sector 32: " << this->TotalSector32 << endl;*/
-
-                releaseMutex();
-            }
-
-            void processFAT()
-            {
-                FatTable = new uint16_t[this->FATSize16 * this->BytesPerSector / 2];
-
-                grabMutex();
-
-                for(int i = 0; i < this->FATSize16; i++)
-                {
-                    readSector(this->ReservedSectorCount + i, (uint8_t*)(FatTable + (i * this->BytesPerSector / 2)), MAX_READ_SIZE);
-                }
-
-                releaseMutex();
-
-                /*for(int i = 0; i < this->FATSize16 * this->BytesPerSector / WORD_SIZE_16; i++)
-                {
-                    cout << std::setw(8) << std::setfill('0') << std::uppercase << std::hex << i * WORD_SIZE_16  << ": ";
-
-                    for(int j = 0; j < WORD_SIZE_16 / 2; j++)
-                    {
-                        cout << std::setw(4) << std::setfill('0') << std::uppercase << std::hex << *(FatTable + (i * WORD_SIZE_16 / 2) + j) << " ";
-                    }
-                    cout << endl;
-                }*/
-            }
-
-            void processRoot()
-            {
-                RootEntries = new uint8_t[this->RootEntryCount * BYTES_PER_ENTRY];
-
-                grabMutex();
-
-                int RootDirectorySectors = (this->RootEntryCount * BYTES_PER_ENTRY) / this->BytesPerSector;
-                for(int i = 0; i < RootDirectorySectors; i++)
-                {
-                    readSector(this->ReservedSectorCount + (this->NumFATs * this->FATSize16) + i, RootEntries + (i * this->BytesPerSector), MAX_READ_SIZE);
-                }
-
-                releaseMutex();
-
-                /*for(int i = 0; i < this->BytesPerSector * BYTES_PER_ENTRY; i += 32)
-                {
-                    if(RootEntries[i] == 0x00)
-                    {
-                        return;
-                    }
-                    else if(RootEntries[i] == 0xE5)
-                    {
-                        continue;
-                    }
-                    else
-                    {
-                        if(RootEntries[i + 11] != ATTR_LONG_NAME)
-                        {
-                            write(1, RootEntries + i, 11);
-
-                            cout << " " << (uint16_t)RootEntries[i + DIR_ATTR] << endl;
-                        }
-                    }
-                }*/
-            }
-
-            void readSector(int sector, uint8_t* base, int size)
-            {
-                ThreadControlBlock* currentThread = myScheduler->getCurrentThread();
-
-                MachineFileSeek(this->fileDescriptor, sector * this->BytesPerSector, 0, fileHandler, (void*)currentThread);
-                waitForIO();
-
-                MachineFileRead(this->fileDescriptor, this->base, size, fileHandler, (void*)currentThread);
-                waitForIO();
-
-                memcpy((void*)base, this->base, size);
-            }
-
-
-            void writeSector(int sector, uint8_t* base, int size)
-            {
-                ThreadControlBlock* currentThread = myScheduler->getCurrentThread();
-
-                MachineFileSeek(this->fileDescriptor, sector * this->BytesPerSector, 0, fileHandler, (void*)currentThread);
-                waitForIO();
-
-                memcpy(this->base, (void*)base, size);
-
-                MachineFileWrite(this->fileDescriptor, this->base, size, fileHandler, (void*)currentThread);
-                waitForIO();
-            }
-    };
-
-    FileSystem* myFileSystem;
-    vector<Directory*> openDirectories;
-    vector<File*> openFiles;
-    vector<Cluster*> cachedClusters;
 
     void createLFN(uint8_t **entry, const char *filename)
     {
@@ -528,7 +248,7 @@ extern "C"
             *entry = *entry + 32;
         }
     }
-
+	
     void updateSFN(char *outputBuffer)
     {
         uint8_t *entry = myFileSystem->RootEntries;
@@ -549,6 +269,48 @@ extern "C"
             }
             entry += BYTES_PER_ENTRY;
         }
+    }
+	
+    void SFN_to_Normal(char* output_name, const char *sfn)
+    {
+        int i = 0;
+        int count = 0;
+        while(i <= 7)
+        {
+            if(sfn[i] != 0x20)
+            {
+                output_name[count] = sfn[i];
+                count++;
+                i++;
+            }
+            else
+            {
+                i++;
+                continue;
+            }
+        }
+
+        if(sfn[i] != 0x20)
+        {
+            output_name[count] = '.';
+            count++;
+            while(i < 11)
+            {
+                if(sfn[i] != 0x20)
+                {
+                    output_name[count] = sfn[i];
+                    count++;
+                    i++;
+                }
+                else
+                {
+                    i++;
+                    continue;
+                }
+            }
+        }
+
+        output_name[count] = '\0';
     }
 
     void Normal_to_SFN(char* outputBuffer, const char* filename, bool update)
@@ -596,48 +358,6 @@ extern "C"
         }
     }
 	
-    void SFN_to_Normal(char* output_name, const char *sfn)
-    {
-        int i = 0;
-        int count = 0;
-        while(i <= 7)
-        {
-            if(sfn[i] != 0x20)
-            {
-                output_name[count] = sfn[i];
-                count++;
-                i++;
-            }
-            else
-            {
-                i++;
-                continue;
-            }
-        }
-
-        if(sfn[i] != 0x20)
-        {
-            output_name[count] = '.';
-            count++;
-            while(i < 11)
-            {
-                if(sfn[i] != 0x20)
-                {
-                    output_name[count] = sfn[i];
-                    count++;
-                    i++;
-                }
-                else
-                {
-                    i++;
-                    continue;
-                }
-            }
-        }
-
-        output_name[count] = '\0';
-    }
-	
     Cluster* findCachedCluster(uint16_t clusterNum)
     {
        Cluster* cluster = NULL;
@@ -659,7 +379,7 @@ extern "C"
         clus->data = new uint8_t[myFileSystem->BytesPerSector * myFileSystem->SectorsPerCluster];
         clus->clusterNum = clusterNum;
 
-        unsigned int seekPosition = myFileSystem->FirstDataSector * 512 + (clusterNum - 2) * myFileSystem->SectorsPerCluster * myFileSystem->BytesPerSector;
+        unsigned int seekPosition = myFileSystem->FirstDataSector * SECTOR_SIZE + (clusterNum - 2) * myFileSystem->SectorsPerCluster * myFileSystem->BytesPerSector;
 
         MachineFileSeek(myFileSystem->fileDescriptor, seekPosition, 0, fileHandler, (void*)myScheduler->getCurrentThread());
         waitForIO();
@@ -668,17 +388,17 @@ extern "C"
 
         for(unsigned int i = 0; i < myFileSystem->SectorsPerCluster; i++)
         {
-            MachineFileRead(myFileSystem->fileDescriptor, myFileSystem->base, 512, fileHandler, (void*)myScheduler->getCurrentThread());
+            MachineFileRead(myFileSystem->fileDescriptor, myFileSystem->base, MAX_READ_SIZE, fileHandler, (void*)myScheduler->getCurrentThread());
             waitForIO();
 
-            memcpy(position, myFileSystem->base, 512);
-            position += 512;
+            memcpy(position, myFileSystem->base, MAX_READ_SIZE);
+            position += MAX_READ_SIZE;
         }
     }
 
     void deleteCachedCluster(Cluster* clus)
     {
-        unsigned int seekPosition = myFileSystem->FirstDataSector * 512 + (clus->clusterNum - 2) * myFileSystem->SectorsPerCluster * myFileSystem->BytesPerSector;
+        unsigned int seekPosition = myFileSystem->FirstDataSector * SECTOR_SIZE + (clus->clusterNum - 2) * myFileSystem->SectorsPerCluster * myFileSystem->BytesPerSector;
 
         MachineFileSeek(myFileSystem->fileDescriptor, seekPosition, 0, fileHandler, (void*)myScheduler->getCurrentThread());
         waitForIO();
@@ -688,10 +408,10 @@ extern "C"
         // Write cluster back.
         for(unsigned int i = 0; i < myFileSystem->SectorsPerCluster; i++)
         {
-            memcpy(myFileSystem->base, position, 512);
-            position += 512;
+            memcpy(myFileSystem->base, position, MAX_WRITE_SIZE);
+            position += MAX_WRITE_SIZE;
 
-            MachineFileWrite(myFileSystem->fileDescriptor, myFileSystem->base, 512, fileHandler, (void*)myScheduler->getCurrentThread());
+            MachineFileWrite(myFileSystem->fileDescriptor, myFileSystem->base, MAX_WRITE_SIZE, fileHandler, (void*)myScheduler->getCurrentThread());
             waitForIO();
        	}
 
@@ -826,8 +546,8 @@ extern "C"
         VMMutexCreate(&FILE_SYSTEM_MUTEX);
 
         // Allocate a 512 Byte block for the FileSystem in shared memory.
-        void* fileSystem_base;
-        status = VMMemoryPoolAllocate(stackID, MAX_WRITE_SIZE, &fileSystem_base);
+        void* fileSystemBase;
+        status = VMMemoryPoolAllocate(stackID, MAX_WRITE_SIZE, &fileSystemBase);
 
         if(status != VM_STATUS_SUCCESS)
         {
@@ -848,7 +568,7 @@ extern "C"
             return VM_STATUS_FAILURE;
         }
 
-        myFileSystem = new FileSystem((char*)mount, fileDescriptor, fileSystem_base);
+        myFileSystem = new FileSystem((char*)mount, fileDescriptor, fileSystemBase, myScheduler);
 
         MachineResumeSignals(&sigstate);
 
@@ -879,7 +599,7 @@ extern "C"
         // Delete the file system mutex.
         VMMutexDelete(FILE_SYSTEM_MUTEX);
 
-        VMMemoryPoolDeallocate(stackID, fileSystem_base);
+        VMMemoryPoolDeallocate(stackID, fileSystemBase);
 
         delete myFileSystem;
 
